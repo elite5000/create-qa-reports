@@ -3,6 +3,7 @@ import { ITestPlanApi } from 'azure-devops-node-api/TestPlanApi';
 import { IWorkApi } from 'azure-devops-node-api/WorkApi';
 import { IWorkItemTrackingApi } from 'azure-devops-node-api/WorkItemTrackingApi';
 import { TeamContext } from 'azure-devops-node-api/interfaces/CoreInterfaces';
+import { TeamSettingsIteration } from 'azure-devops-node-api/interfaces/WorkInterfaces';
 import {
   WorkItem,
   WorkItemErrorPolicy,
@@ -108,13 +109,16 @@ class TestSuiteFinder {
 }
 
 async function fetchIterations(workApi: IWorkApi, teamContext: TeamContext): Promise<DateRange[]> {
-  const timeframes: Array<'past' | 'current' | 'future'> = ['past', 'current', 'future'];
   const seen = new Set<string>();
   const ranges: DateRange[] = [];
-  for (const timeframe of timeframes) {
-    const iterations = await workApi.getTeamIterations(teamContext, timeframe);
+
+  const appendIterations = (iterations: TeamSettingsIteration[] | undefined, timeframeLabel?: string) => {
+    if (!iterations?.length) {
+      return;
+    }
+
     for (const iteration of iterations) {
-      const iterationId = iteration.id ?? `${iteration.name}-${timeframe}`;
+      const iterationId = iteration.id ?? `${iteration.name}-${timeframeLabel ?? 'all'}`;
       if (!iterationId || seen.has(iterationId)) {
         continue;
       }
@@ -129,8 +133,44 @@ async function fetchIterations(workApi: IWorkApi, teamContext: TeamContext): Pro
         ranges.push({ start, finish });
       }
     }
+  };
+
+  const timeframes: Array<'past' | 'current' | 'future'> = ['past', 'current', 'future'];
+  for (const timeframe of timeframes) {
+    try {
+      const iterations = await workApi.getTeamIterations(teamContext, timeframe);
+      appendIterations(iterations, timeframe);
+    } catch (error) {
+      if (!isUnsupportedTimeframeError(error)) {
+        throw error;
+      }
+      const fallbackIterations = await workApi.getTeamIterations(teamContext);
+      appendIterations(fallbackIterations);
+      break;
+    }
   }
+
+  if (!ranges.length) {
+    const allIterations = await workApi.getTeamIterations(teamContext);
+    appendIterations(allIterations);
+  }
+
+  ranges.sort((a, b) => a.start.getTime() - b.start.getTime());
   return ranges;
+}
+
+function isUnsupportedTimeframeError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const message = (error as { message?: unknown }).message;
+  if (typeof message !== 'string') {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  return normalized.includes('timeframe');
 }
 
 async function fetchWorkItemsForRange(

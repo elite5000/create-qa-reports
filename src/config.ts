@@ -5,6 +5,10 @@ export interface Config {
   project: string;
   team: string;
   pat: string;
+  confluenceBaseUrl: string;
+  confluencePageId: string;
+  confluenceEmail: string;
+  confluenceApiToken: string;
 }
 
 let envLoaded = false;
@@ -28,23 +32,37 @@ function ensureEnvLoaded(): void {
 export function loadConfig(): Config {
   ensureEnvLoaded();
 
-  const orgUrl = process.env.AZDO_ORG_URL;
-  const project = process.env.AZDO_PROJECT;
-  const team = process.env.AZDO_TEAM;
-  const pat = process.env.AZDO_PAT;
+  const requireEnv = (name: string, message?: string): string => {
+    const value = process.env[name]?.trim();
+    if (!value) {
+      throw new Error(message ?? `Missing env var ${name}`);
+    }
+    return value;
+  };
 
-  if (!orgUrl) {
-    throw new Error('Missing env var AZDO_ORG_URL (e.g. https://dev.azure.com/your-org)');
-  }
-  if (!project) {
-    throw new Error('Missing env var AZDO_PROJECT');
-  }
-  if (!team) {
-    throw new Error('Missing env var AZDO_TEAM');
-  }
-  if (!pat) {
-    throw new Error('Missing env var AZDO_PAT');
-  }
+  const orgUrl = requireEnv(
+    'AZDO_ORG_URL',
+    'Missing env var AZDO_ORG_URL (e.g. https://dev.azure.com/your-org)'
+  );
+  const project = requireEnv('AZDO_PROJECT');
+  const team = requireEnv('AZDO_TEAM');
+  const pat = requireEnv('AZDO_PAT');
+  const confluenceBaseUrl = requireEnv(
+    'CONFLUENCE_BASE_URL',
+    'Missing env var CONFLUENCE_BASE_URL (e.g. https://your-domain.atlassian.net/wiki)'
+  );
+  const confluencePageId = requireEnv('CONFLUENCE_PAGE_ID');
+  const confluenceEmail = requireEnv('CONFLUENCE_EMAIL');
+  const confluenceApiToken = requireEnv('CONFLUENCE_API_TOKEN');
 
-  return { orgUrl, project, team, pat };
+  return {
+    orgUrl,
+    project,
+    team,
+    pat,
+    confluenceBaseUrl,
+    confluencePageId,
+    confluenceEmail,
+    confluenceApiToken,
+  };
 }

@@ -1,3 +1,5 @@
+import { promises as fs } from 'fs';
+import * as path from 'path';
 import * as azdev from 'azure-devops-node-api';
 import { ITestPlanApi } from 'azure-devops-node-api/TestPlanApi';
 import { IWorkApi } from 'azure-devops-node-api/WorkApi';
@@ -12,7 +14,7 @@ import {
 } from 'azure-devops-node-api/interfaces/WorkItemTrackingInterfaces';
 import { PagedList } from 'azure-devops-node-api/interfaces/common/VSSInterfaces';
 import * as TestPlanInterfaces from 'azure-devops-node-api/interfaces/TestPlanInterfaces';
-import { loadConfig } from './config';
+import { Config, loadConfig } from './config';
 
 interface ReportRow {
   id: number;
@@ -20,9 +22,296 @@ interface ReportRow {
   testSuiteLink: string | null;
 }
 
-interface DateRange {
+interface IterationWindow {
   start: Date;
   finish: Date;
+  name: string;
+  path?: string;
+  id?: string;
+}
+
+interface CliOptions {
+  sprint?: string;
+}
+
+interface IterationSelection {
+  iterations: IterationWindow[];
+  sprintLabel: string;
+}
+
+interface ConfluenceContentResponse {
+  title?: string;
+  body?: {
+    storage?: {
+      value?: string;
+    };
+  };
+  version?: {
+    number?: number;
+  };
+}
+
+interface ConfluenceTemplate {
+  content: string;
+  version: number;
+  title: string;
+  cachedFilePath: string;
+}
+
+const TEMPLATE_CACHE_RELATIVE = path.join('templates', 'confluence-template.html');
+const REPORTS_DIR_RELATIVE = path.join('reports');
+const REPORT_FILE_PREFIX = 'qa-report';
+
+function parseCliOptions(argv: string[]): CliOptions {
+  const options: CliOptions = {};
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--sprint' || arg === '-s') {
+      if (i + 1 >= argv.length) {
+        throw new Error('Expected a value after --sprint.');
+      }
+      options.sprint = argv[++i];
+      continue;
+    }
+    if (arg.startsWith('--sprint=')) {
+      options.sprint = arg.slice('--sprint='.length);
+      continue;
+    }
+    if (arg === '--help' || arg === '-h') {
+      console.log('Usage: npm run dev -- --sprint "Sprint Name"');
+      process.exit(0);
+    }
+    console.warn(`Ignoring unknown argument: ${arg}`);
+  }
+  return options;
+}
+
+function normalizeIterationKey(value: string | undefined): string {
+  return value?.trim().toLocaleLowerCase('en-US') ?? '';
+}
+
+function getCandidateKeys(iteration: IterationWindow): string[] {
+  const keys = new Set<string>();
+  keys.add(normalizeIterationKey(iteration.name));
+  if (iteration.path) {
+    keys.add(normalizeIterationKey(iteration.path));
+    const segments = iteration.path.split('\\');
+    for (const segment of segments) {
+      keys.add(normalizeIterationKey(segment));
+    }
+  }
+  if (iteration.id) {
+    keys.add(normalizeIterationKey(iteration.id));
+  }
+  return Array.from(keys).filter((key) => key.length > 0);
+}
+
+function selectIterations(
+  allIterations: IterationWindow[],
+  sprintName?: string
+): IterationSelection {
+  if (!allIterations.length) {
+    return { iterations: [], sprintLabel: sprintName ?? '' };
+  }
+
+  if (!sprintName) {
+    const now = Date.now();
+    const current = allIterations.find(
+      (iteration) =>
+        iteration.start.getTime() <= now && now <= iteration.finish.getTime()
+    );
+    if (current) {
+      return { iterations: [current], sprintLabel: current.name };
+    }
+    const latest = allIterations[allIterations.length - 1];
+    return { iterations: [latest], sprintLabel: latest.name };
+  }
+
+  const query = normalizeIterationKey(sprintName);
+  const directMatch = allIterations.find((iteration) =>
+    getCandidateKeys(iteration).some((key) => key === query)
+  );
+  if (directMatch) {
+    return { iterations: [directMatch], sprintLabel: directMatch.name };
+  }
+
+  const partialMatch = allIterations.find((iteration) =>
+    getCandidateKeys(iteration).some((key) => key.includes(query))
+  );
+  if (partialMatch) {
+    return { iterations: [partialMatch], sprintLabel: partialMatch.name };
+  }
+
+  throw new Error(`Unable to find an iteration matching sprint "${sprintName}".`);
+}
+
+async function writeFileIfChanged(filePath: string, newContent: string): Promise<void> {
+  let existingContent: string | undefined;
+  try {
+    existingContent = await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException;
+    if (nodeError.code && nodeError.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  if (existingContent === newContent) {
+    return;
+  }
+
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, newContent, 'utf8');
+}
+
+const htmlEscapeMap: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+};
+
+function escapeHtml(value: string): string {
+  return String(value).replace(/[&<>"']/g, (char) => htmlEscapeMap[char] ?? char);
+}
+
+function findTemplateRow(html: string): string {
+  const rowRegex = /<tr\b[\s\S]*?<\/tr>/gi;
+  const matches = html.match(rowRegex);
+  if (!matches) {
+    throw new Error('Template does not contain any table rows.');
+  }
+
+  const target = matches.find(
+    (row) =>
+      row.includes('{id}') && row.includes('{assigned_to}') && row.includes('{test_plan_link}')
+  );
+
+  if (!target) {
+    throw new Error(
+      'Unable to find template table row containing {id}, {assigned_to}, and {test_plan_link}. '
+    );
+  }
+
+  return target;
+}
+
+function renderRowFromTemplate(templateRow: string, row: ReportRow): string {
+  const idValue = escapeHtml(row.id.toString());
+  const assignedValue = escapeHtml(row.assignedTo);
+  const linkValue = row.testSuiteLink ? escapeHtml(row.testSuiteLink) : '';
+  const linkDisplay = row.testSuiteLink ? linkValue : escapeHtml('Not Found');
+
+  let rendered = templateRow;
+  rendered = rendered.replace(/href\s*=\s*"\{test_plan_link\}"/gi, () =>
+    row.testSuiteLink ? `href="${linkValue}"` : ''
+  );
+  rendered = rendered.replace(/\{id\}/g, idValue);
+  rendered = rendered.replace(/\{assigned_to\}/g, assignedValue);
+  rendered = rendered.replace(/\{test_plan_link\}/g, linkDisplay);
+  return rendered;
+}
+
+function renderEmptyRow(templateRow: string): string {
+  let rendered = templateRow;
+  rendered = rendered.replace(/href\s*=\s*"\{test_plan_link\}"/gi, '');
+  rendered = rendered.replace(/\{id\}/g, 'N/A');
+  rendered = rendered.replace(/\{assigned_to\}/g, 'N/A');
+  rendered = rendered.replace(/\{test_plan_link\}/g, 'No completed work items');
+  return rendered;
+}
+
+function buildReportDocument(
+  templateHtml: string,
+  sprintLabel: string,
+  rows: ReportRow[]
+): string {
+  let html = templateHtml.replace(/\{sprint\}/g, escapeHtml(sprintLabel));
+  const templateRow = findTemplateRow(html);
+  const tableRows = rows.length
+    ? rows.map((row) => renderRowFromTemplate(templateRow, row)).join('')
+    : renderEmptyRow(templateRow);
+
+  html = html.replace(templateRow, tableRows);
+  return html;
+}
+
+function slugifySprintLabel(sprintLabel: string): string {
+  const trimmed = sprintLabel.trim();
+  const withoutIllegal = trimmed.replace(/[<>:"/\\|?*]/g, '');
+  const collapsedWhitespace = withoutIllegal.replace(/\s+/g, ' ').trim();
+  const dashed = collapsedWhitespace.replace(/\s+/g, '-');
+  const cleaned = dashed.replace(/-+/g, '-');
+  return cleaned.toLowerCase() || 'report';
+}
+
+function computeReportPaths(sprintLabel: string): { relative: string; absolute: string } {
+  const fileName = `${REPORT_FILE_PREFIX}-${slugifySprintLabel(sprintLabel)}.html`;
+  const relative = path.join(REPORTS_DIR_RELATIVE, fileName);
+  const absolute = path.resolve(process.cwd(), relative);
+  return { relative, absolute };
+}
+
+async function writeReportDocument(
+  sprintLabel: string,
+  html: string
+): Promise<{ relative: string; absolute: string }> {
+  const paths = computeReportPaths(sprintLabel);
+  await writeFileIfChanged(paths.absolute, html);
+  return paths;
+}
+
+async function fetchAndCacheConfluenceTemplate(config: Config): Promise<ConfluenceTemplate> {
+  const trimmedBase = config.confluenceBaseUrl.replace(/\/+$/, '');
+  const baseWithSlash = `${trimmedBase}/`;
+  const pageId = encodeURIComponent(config.confluencePageId);
+  const url = new URL(`rest/api/content/${pageId}`, baseWithSlash);
+  url.searchParams.set('expand', 'body.storage,version');
+
+  const authToken = Buffer.from(
+    `${config.confluenceEmail}:${config.confluenceApiToken}`,
+    'utf8'
+  ).toString('base64');
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Basic ${authToken}`,
+      Accept: 'application/json; charset=utf-8',
+    },
+  });
+
+  const rawBody = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `Confluence template request failed (${response.status} ${response.statusText}): ${rawBody}`
+    );
+  }
+
+  let payload: ConfluenceContentResponse;
+  try {
+    payload = JSON.parse(rawBody) as ConfluenceContentResponse;
+  } catch (error) {
+    throw new Error('Failed to parse Confluence response as JSON.');
+  }
+
+  const content = payload.body?.storage?.value;
+  if (typeof content !== 'string') {
+    throw new Error('Confluence template response did not include storage HTML content.');
+  }
+
+  const version = payload.version?.number ?? 0;
+  const title = payload.title ?? 'Confluence Template';
+
+  const cachePath = path.resolve(process.cwd(), TEMPLATE_CACHE_RELATIVE);
+  await writeFileIfChanged(cachePath, content);
+
+  const relativePath = path.relative(process.cwd(), cachePath) || cachePath;
+  console.log(
+    `Fetched Confluence template "${title}" (version ${version}). Cached at ${relativePath}.`
+  );
+
+  return { content, version, title, cachedFilePath: cachePath };
 }
 
 class TestSuiteFinder {
@@ -108,9 +397,12 @@ class TestSuiteFinder {
   }
 }
 
-async function fetchIterations(workApi: IWorkApi, teamContext: TeamContext): Promise<DateRange[]> {
+async function fetchIterations(
+  workApi: IWorkApi,
+  teamContext: TeamContext
+): Promise<IterationWindow[]> {
   const seen = new Set<string>();
-  const ranges: DateRange[] = [];
+  const ranges: IterationWindow[] = [];
 
   const appendIterations = (iterations: TeamSettingsIteration[] | undefined, timeframeLabel?: string) => {
     if (!iterations?.length) {
@@ -129,8 +421,18 @@ async function fetchIterations(workApi: IWorkApi, teamContext: TeamContext): Pro
       }
       const start = new Date(attributes.startDate);
       const finish = new Date(attributes.finishDate);
+      const name = iteration.name?.trim();
+      if (!name) {
+        continue;
+      }
       if (!Number.isNaN(start.getTime()) && !Number.isNaN(finish.getTime())) {
-        ranges.push({ start, finish });
+        ranges.push({
+          id: iteration.id ?? undefined,
+          name,
+          path: iteration.path ?? undefined,
+          start,
+          finish,
+        });
       }
     }
   };
@@ -176,7 +478,7 @@ function isUnsupportedTimeframeError(error: unknown): boolean {
 async function fetchWorkItemsForRange(
   witApi: IWorkItemTrackingApi,
   project: string,
-  range: DateRange
+  range: IterationWindow
 ): Promise<WorkItem[]> {
   const startIso = range.start.toISOString();
   const finishIso = range.finish.toISOString();
@@ -214,7 +516,7 @@ async function fetchWorkItemsForRange(
       chunk,
       fields,
       undefined,
-      WorkItemExpand.Fields,
+      WorkItemExpand.None,
       WorkItemErrorPolicy.Omit
     );
     items.push(...chunkItems);
@@ -274,6 +576,7 @@ function renderTable(rows: ReportRow[]): void {
 }
 
 async function main(): Promise<void> {
+  const cliOptions = parseCliOptions(process.argv);
   const config = loadConfig();
 
   const authHandler = azdev.getPersonalAccessTokenHandler(config.pat);
@@ -290,17 +593,31 @@ async function main(): Promise<void> {
     connection.getTestPlanApi(),
   ]);
 
-  const ranges = await fetchIterations(workApi, teamContext);
-  if (!ranges.length) {
+  const allIterations = await fetchIterations(workApi, teamContext);
+  if (!allIterations.length) {
     console.log('No iterations with start and finish dates found for the configured team.');
     return;
   }
+
+  const { iterations: selectedIterations, sprintLabel } = selectIterations(
+    allIterations,
+    cliOptions.sprint
+  );
+
+  if (!selectedIterations.length) {
+    console.log('Unable to determine a sprint to report on.');
+    return;
+  }
+
+  console.log(`Generating QA report for sprint: ${sprintLabel}`);
+
+  const confluenceTemplate = await fetchAndCacheConfluenceTemplate(config);
 
   const suiteFinder = new TestSuiteFinder(testPlanApi, config.project, config.orgUrl);
   const seenIds = new Set<number>();
   const rows: ReportRow[] = [];
 
-  for (const range of ranges) {
+  for (const range of selectedIterations) {
     const workItems = await fetchWorkItemsForRange(witApi, config.project, range);
     for (const item of workItems) {
       if (typeof item.id !== 'number' || seenIds.has(item.id)) {
@@ -325,7 +642,15 @@ async function main(): Promise<void> {
     return a.id - b.id;
   });
 
+  const reportHtml = buildReportDocument(
+    confluenceTemplate.content,
+    sprintLabel,
+    rows
+  );
+  const reportPaths = await writeReportDocument(sprintLabel, reportHtml);
+
   renderTable(rows);
+  console.log(`Report ready at ${reportPaths.relative}`);
 }
 
 main().catch((error) => {

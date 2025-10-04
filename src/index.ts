@@ -40,6 +40,7 @@ interface IterationSelection {
 }
 
 interface ConfluenceContentResponse {
+  id?: string;
   title?: string;
   body?: {
     storage?: {
@@ -61,6 +62,68 @@ interface ConfluenceTemplate {
 const TEMPLATE_CACHE_RELATIVE = path.join('templates', 'confluence-template.html');
 const REPORTS_DIR_RELATIVE = path.join('reports');
 const REPORT_FILE_PREFIX = 'qa-report';
+
+interface ConfluencePageSummary {
+  id: string;
+  title: string;
+  versionNumber: number;
+}
+
+interface ConfluenceSearchResponse {
+  results?: Array<{
+    id?: string;
+    title?: string;
+    version?: {
+      number?: number;
+    };
+  }>;
+}
+
+function buildConfluenceBase(config: Config): { trimmed: string; withSlash: string } {
+  const trimmed = config.confluenceBaseUrl.replace(/\/+$/, '');
+  return { trimmed, withSlash: `${trimmed}/` };
+}
+
+function buildConfluenceAuthHeader(config: Config): string {
+  return Buffer.from(
+    `${config.confluenceEmail}:${config.confluenceApiToken}`,
+    'utf8'
+  ).toString('base64');
+}
+
+async function confluenceRequest(
+  config: Config,
+  relativePath: string,
+  init: RequestInit = {}
+): Promise<{ response: Response; text: string }> {
+  const { withSlash } = buildConfluenceBase(config);
+  const url = new URL(relativePath, withSlash);
+
+  const headers = new Headers(init.headers ?? {});
+  headers.set('Authorization', `Basic ${buildConfluenceAuthHeader(config)}`);
+  if (!headers.has('Accept')) {
+    headers.set('Accept', 'application/json; charset=utf-8');
+  }
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json; charset=utf-8');
+  }
+
+  const requestInit: RequestInit = {
+    ...init,
+    headers,
+  };
+
+  const response = await fetch(url.toString(), requestInit);
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Confluence request failed (${response.status} ${response.statusText}) for ${url.pathname}: ${text}`
+    );
+  }
+
+  return { response, text };
+}
 
 function parseCliOptions(argv: string[]): CliOptions {
   const options: CliOptions = {};
@@ -263,34 +326,15 @@ async function writeReportDocument(
 }
 
 async function fetchAndCacheConfluenceTemplate(config: Config): Promise<ConfluenceTemplate> {
-  const trimmedBase = config.confluenceBaseUrl.replace(/\/+$/, '');
-  const baseWithSlash = `${trimmedBase}/`;
   const pageId = encodeURIComponent(config.confluencePageId);
-  const url = new URL(`rest/api/content/${pageId}`, baseWithSlash);
-  url.searchParams.set('expand', 'body.storage,version');
-
-  const authToken = Buffer.from(
-    `${config.confluenceEmail}:${config.confluenceApiToken}`,
-    'utf8'
-  ).toString('base64');
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Basic ${authToken}`,
-      Accept: 'application/json; charset=utf-8',
-    },
-  });
-
-  const rawBody = await response.text();
-  if (!response.ok) {
-    throw new Error(
-      `Confluence template request failed (${response.status} ${response.statusText}): ${rawBody}`
-    );
-  }
+  const { text } = await confluenceRequest(
+    config,
+    `rest/api/content/${pageId}?expand=body.storage,version`
+  );
 
   let payload: ConfluenceContentResponse;
   try {
-    payload = JSON.parse(rawBody) as ConfluenceContentResponse;
+    payload = JSON.parse(text) as ConfluenceContentResponse;
   } catch (error) {
     throw new Error('Failed to parse Confluence response as JSON.');
   }
@@ -312,6 +356,164 @@ async function fetchAndCacheConfluenceTemplate(config: Config): Promise<Confluen
   );
 
   return { content, version, title, cachedFilePath: cachePath };
+}
+
+function computeReportTitle(templateTitle: string, sprintLabel: string): string {
+  const baseTitle = templateTitle?.trim() || 'QA Report';
+  const sprint = sprintLabel.trim();
+  return sprint ? `${baseTitle} - ${sprint}` : baseTitle;
+}
+
+async function findExistingReportPage(
+  config: Config,
+  title: string
+): Promise<ConfluencePageSummary | null> {
+  const spaceKey = encodeURIComponent(config.confluenceSpaceKey);
+  const encodedTitle = encodeURIComponent(title);
+  const { text } = await confluenceRequest(
+    config,
+    `rest/api/content?spaceKey=${spaceKey}&title=${encodedTitle}&expand=version`
+  );
+
+  let payload: ConfluenceSearchResponse;
+  try {
+    payload = JSON.parse(text) as ConfluenceSearchResponse;
+  } catch (error) {
+    throw new Error('Failed to parse Confluence search response as JSON.');
+  }
+
+  const match = payload.results?.find((result) => {
+    if (!result?.title || !result.id) {
+      return false;
+    }
+    return result.title.trim().toLocaleLowerCase('en-US') === title.trim().toLocaleLowerCase('en-US');
+  });
+
+  if (!match?.id) {
+    return null;
+  }
+
+  return {
+    id: match.id,
+    title: match.title ?? title,
+    versionNumber: match.version?.number ?? 1,
+  };
+}
+
+async function createConfluenceReportPage(
+  config: Config,
+  title: string,
+  html: string
+): Promise<ConfluencePageSummary> {
+  const payload: Record<string, unknown> = {
+    type: 'page',
+    title,
+    space: { key: config.confluenceSpaceKey },
+    body: {
+      storage: {
+        value: html,
+        representation: 'storage',
+      },
+    },
+  };
+
+  if (config.confluenceParentPageId) {
+    payload.ancestors = [{ id: config.confluenceParentPageId }];
+  }
+
+  const { text } = await confluenceRequest(config, 'rest/api/content', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+  let response: ConfluenceContentResponse;
+  try {
+    response = JSON.parse(text) as ConfluenceContentResponse;
+  } catch (error) {
+    throw new Error('Failed to parse Confluence create response as JSON.');
+  }
+
+  if (!response.id) {
+    throw new Error('Confluence did not return an ID for the created page.');
+  }
+
+  const versionNumber = response.version?.number ?? 1;
+  return {
+    id: response.id,
+    title: response.title ?? title,
+    versionNumber,
+  };
+}
+
+async function updateConfluenceReportPage(
+  config: Config,
+  existing: ConfluencePageSummary,
+  title: string,
+  html: string
+): Promise<ConfluencePageSummary> {
+  const nextVersion = existing.versionNumber + 1;
+  const payload: Record<string, unknown> = {
+    id: existing.id,
+    type: 'page',
+    title,
+    version: {
+      number: nextVersion,
+    },
+    body: {
+      storage: {
+        value: html,
+        representation: 'storage',
+      },
+    },
+  };
+
+  if (config.confluenceParentPageId) {
+    payload.ancestors = [{ id: config.confluenceParentPageId }];
+  }
+
+  const { text } = await confluenceRequest(
+    config,
+    `rest/api/content/${encodeURIComponent(existing.id)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }
+  );
+
+  let response: ConfluenceContentResponse;
+  try {
+    response = JSON.parse(text) as ConfluenceContentResponse;
+  } catch (error) {
+    throw new Error('Failed to parse Confluence update response as JSON.');
+  }
+
+  const versionNumber = response.version?.number ?? nextVersion;
+  return {
+    id: existing.id,
+    title: response.title ?? title,
+    versionNumber,
+  };
+}
+
+async function syncReportToConfluence(
+  config: Config,
+  sprintLabel: string,
+  html: string,
+  template: ConfluenceTemplate
+): Promise<ConfluencePageSummary> {
+  const title = computeReportTitle(template.title, sprintLabel);
+  const existing = await findExistingReportPage(config, title);
+  if (!existing) {
+    const created = await createConfluenceReportPage(config, title, html);
+    console.log(`Created Confluence page "${created.title}" (ID ${created.id}).`);
+    return created;
+  }
+
+  const updated = await updateConfluenceReportPage(config, existing, title, html);
+  console.log(
+    `Updated Confluence page "${updated.title}" (ID ${updated.id}) to version ${updated.versionNumber}.`
+  );
+  return updated;
 }
 
 class TestSuiteFinder {
@@ -648,9 +850,16 @@ async function main(): Promise<void> {
     rows
   );
   const reportPaths = await writeReportDocument(sprintLabel, reportHtml);
+  const confluencePage = await syncReportToConfluence(
+    config,
+    sprintLabel,
+    reportHtml,
+    confluenceTemplate
+  );
 
   renderTable(rows);
   console.log(`Report ready at ${reportPaths.relative}`);
+  console.log(`Confluence page URL: ${config.confluenceBaseUrl.replace(/\/+$/, '')}/spaces/${encodeURIComponent(config.confluenceSpaceKey)}/pages/${encodeURIComponent(confluencePage.id)}`);
 }
 
 main().catch((error) => {

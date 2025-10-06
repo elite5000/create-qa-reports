@@ -16,7 +16,6 @@ import {
 } from "./devops/workItems";
 import { TestSuiteFinder } from "./devops/testSuiteFinder";
 import {
-    computeReportTitle,
     ConfluencePageResult,
     ConfluenceTemplate,
     fetchAndCacheConfluenceTemplate,
@@ -25,16 +24,16 @@ import {
 import { buildReportDocument } from "./reporting/buildReportDocument";
 import { renderTable } from "./reporting/renderTable";
 import { writeReportDocument } from "./reporting/writeReportDocument";
-import { ReportRow, TemplateRow } from "./reporting/types";
+import { TemplateRow } from "./reporting/types";
 
-async function gatherReportRows(
+async function gatherTemplateRows(
     iterations: IterationWindow[],
     project: string,
     witApi: IWorkItemTrackingApi,
     suiteFinder: TestSuiteFinder
-): Promise<ReportRow[]> {
+): Promise<TemplateRow[]> {
     const seenIds = new Set<number>();
-    const rows: ReportRow[] = [];
+    const rows: TemplateRow[] = [];
 
     for (const range of iterations) {
         const workItems = await fetchWorkItemsForRange(
@@ -54,18 +53,22 @@ async function gatherReportRows(
             );
             rows.push({
                 id: item.id,
-                assignedTo,
-                testSuiteLink,
+                assigned_to: assignedTo,
+                test_plan_link: testSuiteLink ?? undefined,
             });
         }
     }
 
     rows.sort((a, b) => {
-        const assignedCompare = a.assignedTo.localeCompare(b.assignedTo);
+        const assignedA = String(a.assigned_to ?? "");
+        const assignedB = String(b.assigned_to ?? "");
+        const assignedCompare = assignedA.localeCompare(assignedB);
         if (assignedCompare !== 0) {
             return assignedCompare;
         }
-        return a.id - b.id;
+        const idA = typeof a.id === "number" ? a.id : Number(a.id ?? 0);
+        const idB = typeof b.id === "number" ? b.id : Number(b.id ?? 0);
+        return idA - idB;
     });
 
     return rows;
@@ -119,18 +122,14 @@ async function main(): Promise<void> {
         config.project,
         config.orgUrl
     );
-    const rows = await gatherReportRows(
+    const templateRows = await gatherTemplateRows(
         iterationSelection.iterations,
         config.project,
         witApi,
         suiteFinder
     );
 
-    const templateRows: TemplateRow[] = rows.map((row) => ({
-        id: row.id,
-        assigned_to: row.assignedTo,
-        test_plan_link: row.testSuiteLink ?? undefined,
-    }));
+    renderTable(templateRows);
 
     const tableTitle = "Completed Bugs and PBIs";
     const reportHtml = buildReportDocument(
@@ -150,7 +149,6 @@ async function main(): Promise<void> {
         confluenceTemplate
     );
 
-    renderTable(rows);
     console.log(`Report ready at ${reportPaths.relative}`);
     console.log(`Confluence page URL: ${confluencePage.url}`);
 }

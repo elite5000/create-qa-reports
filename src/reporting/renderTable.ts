@@ -1,19 +1,35 @@
-import { ReportRow } from './types';
+import { formatTemplateValue } from '../utils/format';
+import { TemplateRow } from './types';
 
 const NO_DATA_MESSAGE = 'No completed Bugs or PBIs found for the configured sprints.';
 
-export function renderTable(rows: ReportRow[]): void {
+function toHeaderTitle(key: string): string {
+  const spaced = key.replace(/_/g, ' ');
+  return spaced.replace(/\b([a-z])/g, (_, char: string) => char.toUpperCase());
+}
+
+export function renderTable(rows: TemplateRow[]): void {
   if (!rows.length) {
     console.log(NO_DATA_MESSAGE);
     return;
   }
 
-  const headers = ['ID', 'Assigned To', 'Test Suite Link'];
-  const data = rows.map((row) => [
-    row.id.toString(),
-    row.assignedTo,
-    row.testSuiteLink ?? 'N/A',
-  ]);
+  const columnKeys = Array.from(
+    rows.reduce<Set<string>>((set, row) => {
+      Object.keys(row).forEach((key) => set.add(key));
+      return set;
+    }, new Set<string>())
+  );
+
+  if (!columnKeys.length) {
+    console.log(NO_DATA_MESSAGE);
+    return;
+  }
+
+  const headers = columnKeys.map(toHeaderTitle);
+  const data = rows.map((row) =>
+    columnKeys.map((key) => formatTemplateValue(row[key]))
+  );
 
   const colWidths = headers.map((header, idx) =>
     Math.max(

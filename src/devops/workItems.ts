@@ -7,17 +7,18 @@ import {
 } from 'azure-devops-node-api/interfaces/WorkItemTrackingInterfaces';
 import { IterationWindow } from './iterations';
 
-export const DEFAULT_WORK_ITEM_FIELDS: string[] = [
-  'System.Id',
-  'System.AssignedTo',
-  'Microsoft.VSTS.Common.ClosedDate',
-];
+export type WorkItemFieldMap = Record<string, string>;
+
+export const DEFAULT_WORK_ITEM_FIELDS: WorkItemFieldMap = {
+  id: 'System.Id',
+  assigned_to: 'System.AssignedTo',
+};
 
 export async function fetchWorkItemsForRange(
   witApi: IWorkItemTrackingApi,
   project: string,
   range: IterationWindow,
-  field: string[]
+  fieldMap: WorkItemFieldMap
 ): Promise<WorkItem[]> {
   const startIso = range.start.toISOString();
   const finishIso = range.finish.toISOString();
@@ -41,7 +42,7 @@ export async function fetchWorkItemsForRange(
     return [];
   }
 
-  const requestedFields = field.length ? field : DEFAULT_WORK_ITEM_FIELDS;
+  const requestedFields = Object.values(fieldMap);
   const fields = Array.from(new Set([...requestedFields, 'System.Id']));
 
   const items: WorkItem[] = [];

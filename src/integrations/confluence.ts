@@ -164,7 +164,7 @@ export async function fetchAndCacheConfluenceTemplate(
     };
 }
 
-function computeReportTitle(
+export function computeReportTitle(
     templateTitle: string,
     sprintLabel: string
 ): string {

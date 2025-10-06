@@ -1,6 +1,6 @@
 import * as path from "path";
-import { Config } from "./config";
-import { writeFileIfChanged } from "./fs-utils";
+import { Config } from "../config";
+import { writeFileIfChanged } from "../utils/fs";
 
 export interface ConfluenceTemplate {
     content: string;

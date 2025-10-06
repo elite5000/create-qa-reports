@@ -1,5 +1,6 @@
 import * as path from 'path';
-import { writeFileIfChanged } from './fs-utils';
+import { writeFileIfChanged } from '../utils/fs';
+import { formatTemplateValue, TemplateValue } from '../utils/format';
 
 export interface ReportRow {
   id: number;
@@ -7,8 +8,11 @@ export interface ReportRow {
   testSuiteLink: string | null;
 }
 
+export type TemplateRow = Record<string, TemplateValue>;
+
 const REPORTS_DIR_RELATIVE = path.join('reports');
 const REPORT_FILE_PREFIX = 'qa-report';
+const NO_WORK_ITEMS_MESSAGE = 'No work items found';
 
 const htmlEscapeMap: Record<string, string> = {
   '&': '&amp;',
@@ -18,8 +22,14 @@ const htmlEscapeMap: Record<string, string> = {
   "'": '&#39;',
 };
 
+const REGEX_SPECIAL_CHARACTERS = /[.*+?^${}()|[\]\\]/g;
+
 function escapeHtml(value: string): string {
   return String(value).replace(/[&<>"']/g, (char) => htmlEscapeMap[char] ?? char);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(REGEX_SPECIAL_CHARACTERS, '\\$&');
 }
 
 function findTemplateRow(html: string): string {
@@ -29,55 +39,72 @@ function findTemplateRow(html: string): string {
     throw new Error('Template does not contain any table rows.');
   }
 
-  const target = matches.find(
-    (row) =>
-      row.includes('{id}') && row.includes('{assigned_to}') && row.includes('{test_plan_link}')
-  );
-
+  const target = matches.find((row) => /\{[^}]+\}/.test(row));
   if (!target) {
-    throw new Error(
-      'Unable to find template table row containing {id}, {assigned_to}, and {test_plan_link}. '
-    );
+    throw new Error('Unable to find template table row containing placeholders.');
   }
 
   return target;
 }
 
-function renderRowFromTemplate(templateRow: string, row: ReportRow): string {
-  const idValue = escapeHtml(row.id.toString());
-  const assignedValue = escapeHtml(row.assignedTo);
-  const linkValue = row.testSuiteLink ? escapeHtml(row.testSuiteLink) : '';
-  const linkDisplay = row.testSuiteLink ? linkValue : escapeHtml('Not Found');
+function extractPlaceholders(templateRow: string): string[] {
+  const matches = templateRow.match(/\{([^}]+)\}/g) ?? [];
+  const placeholders = matches.map((placeholder) => placeholder.slice(1, -1));
+  return Array.from(new Set(placeholders));
+}
 
+function replacePlaceholder(
+  source: string,
+  key: string,
+  value: string,
+  removeHrefWhenMissing: boolean
+): string {
+  const escapedKey = escapeRegExp(key);
+  const hrefPattern = new RegExp(`href\\s*=\\s*"\\{${escapedKey}\\}"`, 'gi');
+  const shouldRemoveHref =
+    removeHrefWhenMissing && (value === NO_WORK_ITEMS_MESSAGE || value === 'N/A');
+  source = source.replace(hrefPattern, shouldRemoveHref ? '' : `href="${value}"`);
+
+  const placeholderPattern = new RegExp(`\\{${escapedKey}\\}`, 'g');
+  return source.replace(placeholderPattern, value);
+}
+
+function renderRowFromTemplate(
+  templateRow: string,
+  placeholders: string[],
+  row: TemplateRow
+): string {
   let rendered = templateRow;
-  rendered = rendered.replace(/href\s*=\s*"\{test_plan_link\}"/gi, () =>
-    row.testSuiteLink ? `href="${linkValue}"` : ''
-  );
-  rendered = rendered.replace(/\{id\}/g, idValue);
-  rendered = rendered.replace(/\{assigned_to\}/g, assignedValue);
-  rendered = rendered.replace(/\{test_plan_link\}/g, linkDisplay);
+  for (const key of placeholders) {
+    const formatted = formatTemplateValue(row[key]);
+    const escaped = escapeHtml(formatted);
+    rendered = replacePlaceholder(rendered, key, escaped, true);
+  }
   return rendered;
 }
 
-function renderEmptyRow(templateRow: string): string {
+function renderEmptyRow(templateRow: string, placeholders: string[]): string {
   let rendered = templateRow;
-  rendered = rendered.replace(/href\s*=\s*"\{test_plan_link\}"/gi, '');
-  rendered = rendered.replace(/\{id\}/g, 'N/A');
-  rendered = rendered.replace(/\{assigned_to\}/g, 'N/A');
-  rendered = rendered.replace(/\{test_plan_link\}/g, 'No completed work items');
+  for (const key of placeholders) {
+    const escaped = escapeHtml(NO_WORK_ITEMS_MESSAGE);
+    rendered = replacePlaceholder(rendered, key, escaped, true);
+  }
   return rendered;
 }
 
 export function buildReportDocument(
   templateHtml: string,
   sprintLabel: string,
-  rows: ReportRow[]
+  rows: TemplateRow[]
 ): string {
   let html = templateHtml.replace(/\{sprint\}/g, escapeHtml(sprintLabel));
   const templateRow = findTemplateRow(html);
+  const placeholders = extractPlaceholders(templateRow);
   const tableRows = rows.length
-    ? rows.map((row) => renderRowFromTemplate(templateRow, row)).join('')
-    : renderEmptyRow(templateRow);
+    ? rows
+        .map((row) => renderRowFromTemplate(templateRow, placeholders, row))
+        .join('')
+    : renderEmptyRow(templateRow, placeholders);
 
   html = html.replace(templateRow, tableRows);
   return html;
@@ -118,7 +145,7 @@ export function renderTable(rows: ReportRow[]): void {
   const data = rows.map((row) => [
     row.id.toString(),
     row.assignedTo,
-    row.testSuiteLink ?? 'Not Found',
+    row.testSuiteLink ?? 'N/A',
   ]);
 
   const colWidths = headers.map((header, idx) =>

@@ -2,27 +2,32 @@ import * as azdev from 'azure-devops-node-api';
 import { IWorkItemTrackingApi } from 'azure-devops-node-api/WorkItemTrackingApi';
 import { TeamContext } from 'azure-devops-node-api/interfaces/CoreInterfaces';
 import { loadConfig } from './config';
-import { parseCliOptions } from './cli';
+import { parseCliOptions } from './cli/options';
 import {
   fetchIterations,
   IterationWindow,
   selectIterations,
   IterationSelection,
-} from './iterations';
+} from './devops/iterations';
 import {
   ConfluencePageResult,
   ConfluenceTemplate,
   fetchAndCacheConfluenceTemplate,
   syncReportToConfluence,
-} from './confluence';
-import { TestSuiteFinder } from './testSuiteFinder';
+} from './integrations/confluence';
+import { TestSuiteFinder } from './devops/testSuiteFinder';
 import {
   ReportRow,
+  TemplateRow,
   buildReportDocument,
   renderTable,
   writeReportDocument,
-} from './reporting';
-import { fetchWorkItemsForRange, extractAssignedTo } from './workItems';
+} from './reporting/htmlReport';
+import {
+  DEFAULT_WORK_ITEM_FIELDS,
+  fetchWorkItemsForRange,
+  extractAssignedTo,
+} from './devops/workItems';
 
 async function gatherReportRows(
   iterations: IterationWindow[],
@@ -34,7 +39,12 @@ async function gatherReportRows(
   const rows: ReportRow[] = [];
 
   for (const range of iterations) {
-    const workItems = await fetchWorkItemsForRange(witApi, project, range);
+    const workItems = await fetchWorkItemsForRange(
+      witApi,
+      project,
+      range,
+      DEFAULT_WORK_ITEM_FIELDS
+    );
     for (const item of workItems) {
       if (typeof item.id !== 'number' || seenIds.has(item.id)) {
         continue;
@@ -107,10 +117,16 @@ async function main(): Promise<void> {
     suiteFinder
   );
 
+  const templateRows: TemplateRow[] = rows.map((row) => ({
+    id: row.id,
+    assigned_to: row.assignedTo,
+    test_plan_link: row.testSuiteLink ?? undefined,
+  }));
+
   const reportHtml = buildReportDocument(
     confluenceTemplate.content,
     iterationSelection.sprintLabel,
-    rows
+    templateRows
   );
   const reportPaths = await writeReportDocument(iterationSelection.sprintLabel, reportHtml);
   const confluencePage: ConfluencePageResult = await syncReportToConfluence(

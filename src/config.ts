@@ -9,7 +9,7 @@ export interface Config {
   confluencePageId: string;
   confluenceEmail: string;
   confluenceApiToken: string;
-  confluenceSpaceKey: string;
+  confluenceSpaceKey?: string;
   confluenceParentPageId?: string;
 }
 
@@ -56,7 +56,7 @@ export function loadConfig(): Config {
   const confluencePageId = requireEnv('CONFLUENCE_PAGE_ID');
   const confluenceEmail = requireEnv('CONFLUENCE_EMAIL');
   const confluenceApiToken = requireEnv('CONFLUENCE_API_TOKEN');
-  const confluenceSpaceKey = requireEnv('CONFLUENCE_SPACE_KEY');
+  const confluenceSpaceKey = process.env.CONFLUENCE_SPACE_KEY?.trim();
   const confluenceParentPageId = process.env.CONFLUENCE_PARENT_PAGE_ID?.trim();
 
   return {
@@ -68,7 +68,7 @@ export function loadConfig(): Config {
     confluencePageId,
     confluenceEmail,
     confluenceApiToken,
-    confluenceSpaceKey,
+    confluenceSpaceKey: confluenceSpaceKey || undefined,
     confluenceParentPageId: confluenceParentPageId || undefined,
   };
 }
